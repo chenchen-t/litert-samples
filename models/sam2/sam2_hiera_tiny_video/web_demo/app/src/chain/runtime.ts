@@ -71,6 +71,10 @@ interface Sam2ChainNative {
   readScores(object: number, t: number): Promise<Float32Array | null>;
   readPixels(): Promise<Float32Array | null>;
   readOutput(): Promise<Float32Array | null>;
+  loadRelations?(weights: string): Promise<boolean>;
+  relationPredicates?(): number;
+  relationClasses?(): number;
+  relations?(t: number, classes: number[]): Promise<Float32Array | null>;
   times(): {encode: number; step: number; composite: number};
   lastError(): string;
 }
@@ -264,6 +268,31 @@ export class ChainRuntime {
   readPixels() { return this.chain.readPixels(); }
   readOutput() { return this.chain.readOutput(); }
   times() { return this.chain.times(); }
+
+  /** Whether this wasm build has the Tensor API relation head (relhead_graph.cc). */
+  get hasRelationHead(): boolean { return typeof this.chain.loadRelations === 'function'; }
+  /**
+   * Authors (Tensor API, in C++) + compiles the learned relation head from
+   * `url` (relhead.safetensors, ram/export_tensorapi.py). It then reads the
+   * pipeline's low-res masks in place on the GPU; see relations().
+   */
+  async loadRelations(url: string): Promise<{predicates: number; classes: number}> {
+    if (!this.hasRelationHead) throw new Error('this wasm build has no relation head');
+    this.mod.FS.writeFile('/relhead.safetensors', await fetchBytes(url, undefined, false));
+    const ok = await this.chain.loadRelations!('/relhead.safetensors');
+    this.mod.FS.unlink('/relhead.safetensors');
+    this.check(ok, 'loadRelations');
+    return {predicates: this.chain.relationPredicates!(), classes: this.chain.relationClasses!()};
+  }
+  /**
+   * Relation logits of frame t: [maxObjects, maxObjects, P] (subject slot,
+   * object slot, predicate). classes[slot] = class index (0 = unknown).
+   */
+  async relations(t: number, classes: number[]): Promise<Float32Array> {
+    const out = await this.chain.relations!(t, classes);
+    if (!out) throw new Error(`relations ${t}: ${this.chain.lastError()}`);
+    return out;
+  }
 
   /** Per-run profiling in the LiteRT.js bridge (see litert_js_bridge.js). */
   setProfile(mode: ProfileMode) {

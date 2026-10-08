@@ -138,3 +138,71 @@ cc_test(
         "@litert_archive//tensor/examples/gemma3:safetensors",
     ],
 )
+
+# The learned relation head (ram/) as a Tensor API graph.
+cc_library(
+    name = "relhead_graph",
+    srcs = ["relhead_graph.cc"],
+    hdrs = ["relhead_graph.h"],
+    deps = [
+        ":chain_graphs",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/log:absl_check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@litert_archive//tensor",
+        "@litert_archive//tensor:arithmetic",
+        "@litert_archive//tensor:buffer",
+        "@litert_archive//tensor:datatypes",
+        "@litert_archive//tensor/backends/tflite:arithmetic_tflite",
+        "@litert_archive//tensor/backends/tflite:tflite_flatbuffer_conversion",
+        "@litert_archive//tensor/examples/gemma3:safetensor_loader",
+        "@litert_archive//tensor/examples/gemma3:safetensors",
+    ],
+)
+
+cc_library(
+    name = "relhead_runner",
+    srcs = ["relhead_runner.cc"],
+    hdrs = ["relhead_runner.h"],
+    deps = [
+        ":relhead_graph",
+        ":sam2_pipeline",
+        ":signature_stage",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@litert_archive//litert/cc:litert_environment",
+    ],
+)
+
+#   bazel test //models/sam2/sam2_hiera_tiny_video/web_demo/cc:relhead_graph_test --test_output=all
+cc_test(
+    name = "relhead_graph_test",
+    srcs = ["relhead_graph_test.cc"],
+    args = [
+        "--weights=$(location //models/sam2/sam2_hiera_tiny_video/web_demo/cc/testdata:relhead.safetensors)",
+        "--fixture=$(location //models/sam2/sam2_hiera_tiny_video/web_demo/cc/testdata:relhead_fixture.safetensors)",
+    ],
+    data = [
+        "//models/sam2/sam2_hiera_tiny_video/web_demo/cc/testdata:relhead.safetensors",
+        "//models/sam2/sam2_hiera_tiny_video/web_demo/cc/testdata:relhead_fixture.safetensors",
+    ] + litert_gpu_accelerator_prebuilts(),
+    deps = [
+        ":relhead_graph",
+        ":relhead_runner",
+        ":sam2_pipeline",
+        ":signature_stage",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest",
+        "@litert_archive//litert/cc:litert_compiled_model",
+        "@litert_archive//litert/cc:litert_environment",
+        "@litert_archive//litert/cc:litert_options",
+        "@litert_archive//litert/cc/options:litert_gpu_options",
+        "@litert_archive//tensor/examples/gemma3:safetensor_loader",
+        "@litert_archive//tensor/examples/gemma3:safetensors",
+    ],
+)

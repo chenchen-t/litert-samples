@@ -66,6 +66,9 @@ add_executable(sam2_chain
   ${CC_DIR}/host_plan.cc
   ${CC_DIR}/signature_stage.cc
   ${CC_DIR}/sam2_pipeline.cc
+  # Learned relation head (ram/README.md section 6)
+  ${CC_DIR}/relhead_graph.cc
+  ${CC_DIR}/relhead_runner.cc
   # Browser runtime + JS API
   litert_js_runtime.cc
   sam2_wasm.cc
@@ -87,6 +90,10 @@ target_link_libraries(sam2_chain PRIVATE
   absl::inlined_vector absl::random_random absl::algorithm_container
   absl::optional absl::cleanup
 )
+# Newer absl LTS releases move StatusBuilder into its own target.
+if(TARGET absl::status_builder)
+  target_link_libraries(sam2_chain PRIVATE absl::status_builder)
+endif()
 
 target_link_options(sam2_chain PRIVATE
   -O2

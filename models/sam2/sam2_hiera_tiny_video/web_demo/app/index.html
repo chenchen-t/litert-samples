@@ -39,6 +39,34 @@
         <p id="overlayText">Loading model…</p>
         <div class="progress slim" id="loadProgress"><div class="bar" id="loadBar"></div></div>
       </div>
+      <aside class="relLog" id="relLogPanel" hidden aria-label="Relation log">
+        <header>
+          <b>Relation log</b>
+          <span class="count" id="relLogCount"></span>
+          <button class="x" id="relLogClose" title="Close">×</button>
+        </header>
+        <div class="bar">
+          <div class="seg" id="relLogView" role="radiogroup" aria-label="Log view">
+            <button data-v="frames" class="on" title="frame idx: relations on that frame">Frames</button>
+            <button data-v="events" title="Each relation once, with the frames it held over">Events</button>
+          </div>
+          <button class="btn" id="relLogJson" title="Save frames + events as JSON">JSON</button>
+          <button class="btn" id="relLogCsv" title="Save one row per (frame, relation) as CSV">CSV</button>
+          <button class="btn ghost" id="relLogClear" title="Clear the log">Clear</button>
+        </div>
+        <p class="legend">frame idx (0-based) · time · relations — click a row to jump to that frame</p>
+        <ol id="relLogList"></ol>
+      </aside>
+      <aside class="relLog relPreds" id="relPredPanel" hidden aria-label="Relation predicates">
+        <header>
+          <b>Predicates</b>
+          <span class="count" id="relPredCount"></span>
+          <button class="x" id="relPredClose" title="Close">×</button>
+        </header>
+        <div class="bar presets" id="relPredPresets"></div>
+        <p class="legend">Only checked predicates are shown and logged; each pair shows its best checked one.</p>
+        <div class="groups" id="relPredGroups"></div>
+      </aside>
     </div>
     <div class="transport">
       <button class="icon" id="playBtn" title="Play / pause (space)" disabled>▶</button>
@@ -47,8 +75,12 @@
         <input type="range" id="scrubber" min="0" max="0" value="0" disabled aria-label="Frame" />
       </div>
       <span class="counter" id="counter">0 / 0</span>
+      <button class="icon relBtn" id="relBtn" title="Show relations between tracked objects">⇄</button>
+      <button class="icon relBtn" id="logBtn" title="Relation log: frame idx → relations; click to trace back, save JSON / CSV">☰</button>
+      <button class="icon relBtn" id="predBtn" title="Choose which relation predicates to show (PSG)">◇</button>
     </div>
     <p class="stats" id="stats"></p>
+    <p class="rels" id="relList" aria-live="polite"></p>
   </section>
 
   <nav class="tabs" id="dockTabs" role="tablist" aria-label="Controls">

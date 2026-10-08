@@ -24,6 +24,7 @@
 #include <emscripten/bind.h>
 #include <emscripten/val.h>
 
+#include <array>
 #include <memory>
 #include <string>
 #include <utility>
@@ -38,6 +39,8 @@
 #include "litert/cc/litert_options.h"
 #include "models/sam2/sam2_hiera_tiny_video/tensor_api/sam2_image/sam2_weights.h"
 #include "models/sam2/sam2_hiera_tiny_video/tensor_api/sam2_video/sam2v_weights.h"
+#include "relhead_graph.h"
+#include "relhead_runner.h"
 #include "sam2_pipeline.h"
 #include "tensor/backends/tflite/tflite_flatbuffer_conversion.h"
 
@@ -100,7 +103,7 @@ class Sam2Chain {
     auto env = litert::Environment::Create({});
     if (!env) return Fail(absl::InternalError("Environment::Create failed"));
     env_ = std::make_shared<litert::Environment>(std::move(*env));
-    auto compile = [env = env_](const std::string& path)
+    compile_ = [env = env_](const std::string& path)
         -> absl::StatusOr<std::shared_ptr<litert::CompiledModel>> {
       auto options = litert::Options::Create();
       if (!options) return absl::InternalError("Options::Create failed");
@@ -112,16 +115,51 @@ class Sam2Chain {
       }
       return std::make_shared<litert::CompiledModel>(std::move(*model));
     };
-    auto sam2_model = compile(sam2_tflite_path);
+    auto sam2_model = compile_(sam2_tflite_path);
     if (!sam2_model.ok()) return Fail(sam2_model.status());
     PipelineOptions options;
     options.nmm = nmm;
     options.scratch_dir = "/tmp";
     auto p = Sam2Pipeline::Create(env_, *sam2_model, *std::move(consts),
-                                  compile, options);
+                                  compile_, options);
     if (!p.ok()) return Fail(p.status());
     pipeline_ = std::move(*p);
     return true;
+  }
+
+  // Authors + compiles the learned relation head (relhead_graph.h) from the
+  // safetensors at `weights_path`; it reads the pipeline's low-res mask
+  // buffers in place. async. Call after Init.
+  bool LoadRelations(std::string weights_path) {
+    if (!pipeline_) return Fail(absl::FailedPreconditionError("init first"));
+    auto w = LoadRelHeadWeights(weights_path);
+    if (!w.ok()) return Fail(w.status());
+    auto r = RelationRunner::Create(env_, compile_, *w, ImageSize() / 4, "/tmp");
+    if (!r.ok()) return Fail(r.status());
+    relations_ = std::move(*r);
+    return true;
+  }
+  int RelationPredicates() const {
+    return relations_ ? relations_->predicates() : 0;
+  }
+  int RelationClasses() const { return relations_ ? relations_->classes() : 0; }
+  // classes: [kMaxObjects] class index per slot (0 = unknown). Returns the
+  // logits [kMaxObjects, kMaxObjects, P] (subject, object, predicate) of
+  // frame t, or null on error. async.
+  val Relations(int t, val classes) {
+    if (!relations_) {
+      error_ = "relations not loaded";
+      return val::null();
+    }
+    std::array<int, kMaxObjects> cls{};
+    const int n = classes["length"].as<int>();
+    for (int i = 0; i < n && i < kMaxObjects; ++i) cls[i] = classes[i].as<int>();
+    auto logits = relations_->Run(*pipeline_, t, cls);
+    if (!logits.ok()) {
+      Fail(logits.status());
+      return val::null();
+    }
+    return Floats(*logits);
   }
 
   int ImageSize() const { return pipeline_ ? pipeline_->image_size() : 0; }
@@ -254,7 +292,9 @@ class Sam2Chain {
   }
 
   std::shared_ptr<litert::Environment> env_;
+  ModelCompiler compile_;
   std::unique_ptr<Sam2Pipeline> pipeline_;
+  std::unique_ptr<RelationRunner> relations_;
   std::string error_;
 };
 
@@ -288,6 +328,10 @@ EMSCRIPTEN_BINDINGS(sam2_chain) {
       .function("readScores", &Sam2Chain::ReadScores, async())
       .function("readPixels", &Sam2Chain::ReadPixels, async())
       .function("readOutput", &Sam2Chain::ReadOutput, async())
+      .function("loadRelations", &Sam2Chain::LoadRelations, async())
+      .function("relationPredicates", &Sam2Chain::RelationPredicates)
+      .function("relationClasses", &Sam2Chain::RelationClasses)
+      .function("relations", &Sam2Chain::Relations, async())
       .function("times", &Sam2Chain::Times)
       .function("lastError", &Sam2Chain::LastError);
   // Object slots compiled into the composite graph (the UI caps objects here).

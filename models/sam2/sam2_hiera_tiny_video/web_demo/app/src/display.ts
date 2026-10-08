@@ -149,4 +149,76 @@ export class GpuView {
       g.stroke();
     }
   }
+
+  /**
+   * Relation edges over the markers (call after drawMarkers): an arrow from
+   * the subject's centroid to the object's, with the predicate in a chip at
+   * the middle. Symmetric predicates get no arrow head.
+   */
+  drawRelations(edges: RelationEdge[]) {
+    if (!edges.length) return;
+    const g = this.marks.getContext('2d')!;
+    const {width: W, height: H} = this.marks;
+    const s = Math.max(W / 960, 0.6);
+    g.save();
+    g.font = `600 ${Math.round(13 * s)}px system-ui, sans-serif`;
+    g.textBaseline = 'middle';
+    g.lineCap = 'round';
+    for (const e of edges) {
+      const ax = e.x0 * W, ay = e.y0 * H, bx = e.x1 * W, by = e.y1 * H;
+      const len = Math.hypot(bx - ax, by - ay);
+      if (len < 4) continue;
+      const ux = (bx - ax) / len, uy = (by - ay) / len;
+      // Leave the centroids visible: start / stop a little short.
+      const pad = Math.min(14 * s, len * 0.2);
+      const sx = ax + ux * pad, sy = ay + uy * pad, ex = bx - ux * pad, ey = by - uy * pad;
+      const col = `rgb(${e.color.join(',')})`;
+      g.globalAlpha = 0.35 + 0.65 * Math.min(1, e.score);
+      for (const [w, c] of [[5 * s, 'rgba(0,0,0,0.6)'], [2.5 * s, col]] as const) {
+        g.lineWidth = w;
+        g.strokeStyle = c;
+        g.beginPath();
+        g.moveTo(sx, sy);
+        g.lineTo(ex, ey);
+        if (e.directed) {
+          const h = 10 * s;
+          g.moveTo(ex, ey);
+          g.lineTo(ex - ux * h - uy * h * 0.6, ey - uy * h + ux * h * 0.6);
+          g.moveTo(ex, ey);
+          g.lineTo(ex - ux * h + uy * h * 0.6, ey - uy * h - ux * h * 0.6);
+        }
+        g.stroke();
+      }
+      for (const [x, y] of [[ax, ay], [bx, by]]) {
+        g.beginPath();
+        g.arc(x, y, 4 * s, 0, Math.PI * 2);
+        g.fillStyle = '#fff';
+        g.fill();
+      }
+      const mx = (ax + bx) / 2, my = (ay + by) / 2;
+      const tw = g.measureText(e.text).width, ph = 20 * s, pw = tw + 14 * s;
+      g.fillStyle = 'rgba(15,17,26,0.82)';
+      g.beginPath();
+      g.roundRect(mx - pw / 2, my - ph / 2, pw, ph, ph / 2);
+      g.fill();
+      g.lineWidth = 1.5 * s;
+      g.strokeStyle = col;
+      g.stroke();
+      g.fillStyle = '#fff';
+      g.fillText(e.text, mx - tw / 2, my + 0.5);
+    }
+    g.restore();
+  }
+}
+
+/** A relation drawn on the frame (normalized coords). */
+export interface RelationEdge {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+  text: string;
+  color: [number, number, number];
+  score: number;
+  directed: boolean;
 }

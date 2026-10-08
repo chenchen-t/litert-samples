@@ -80,6 +80,48 @@ h1 { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: -0.01em; whit
 /* object-fit keeps the frame letterboxed inside whatever space is left. */
 #view, #marks { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: block; }
 #view { cursor: crosshair; touch-action: none; }  /* box drags must not scroll / zoom */
+/* Relation log: a drawer over the right of the video (the page layout never changes). */
+.relLog {
+  position: absolute; top: 8px; right: 8px; bottom: 8px; width: min(440px, 46%); z-index: 3;
+  display: flex; flex-direction: column; gap: 6px; padding: 8px 10px;
+  background: rgba(17, 20, 28, 0.94); border: 1px solid var(--line); border-radius: var(--radius);
+  backdrop-filter: blur(6px); font-size: 12px;
+}
+.relLog[hidden] { display: none; }
+.relLog header { display: flex; align-items: center; gap: 8px; }
+.relLog header .count { color: var(--muted); flex: 1; font-variant-numeric: tabular-nums; }
+.relLog header .x { border: 0; background: none; color: var(--muted); font-size: 18px; cursor: pointer; line-height: 1; }
+.relLog .bar { display: flex; gap: 6px; align-items: center; }
+.relLog .bar .seg { flex: 1; }
+.relLog .bar .btn { padding: 4px 9px; font-size: 12px; }
+.relLog .legend { margin: 0; color: var(--muted); font-size: 11px; }
+.relLog ol { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; min-height: 0; }
+.relLog li {
+  display: grid; grid-template-columns: 4.6em 4.4em 1fr; gap: 6px; align-items: baseline;
+  padding: 4px 6px; border-radius: 6px; cursor: pointer; border: 1px solid transparent;
+}
+.relLog li:hover { background: #1f2533; }
+.relLog li.cur { border-color: var(--accent); background: #1c2232; }
+.relLog li.empty { display: block; color: var(--muted); cursor: default; }
+.relLog .fi { font: 600 11.5px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text); }
+.relLog .ft { font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); }
+.relLog .rs { line-height: 1.5; }
+.relLog .rs i { color: var(--muted); font-style: normal; margin: 0 5px; }
+.relLog .rs em { color: var(--muted); font-style: normal; font-size: 11px; margin-left: 4px; }
+.relLog .tag { border-left: 3px solid var(--c); padding-left: 4px; }
+.relLog .tag sup { color: var(--muted); font-size: 9px; margin-left: 1px; }
+.relPreds .presets { flex-wrap: wrap; }
+.relPreds .groups { overflow-y: auto; flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 8px; }
+.relPreds fieldset { border: 1px solid var(--line); border-radius: 8px; margin: 0; padding: 4px 8px 6px; min-width: 0; }
+.relPreds legend { color: var(--muted); font-size: 11px; padding: 0 4px; cursor: pointer; }
+.relPreds .predChips { display: flex; flex-wrap: wrap; gap: 4px; }
+.relPreds label {
+  display: inline-flex; align-items: center; gap: 4px; padding: 2px 7px; border-radius: 999px;
+  border: 1px solid var(--line); cursor: pointer; user-select: none; color: var(--muted);
+}
+.relPreds label:has(input:checked) { color: var(--text); border-color: var(--accent); background: #1c2232; }
+.relPreds label input { margin: 0; accent-color: var(--accent); }
+.relPreds label.na { opacity: .45; }
 #marks { pointer-events: none; }
 #view.busy { cursor: progress; }
 .overlayMsg {
@@ -115,6 +157,12 @@ h1 { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: -0.01em; whit
   display: flex; align-items: center; gap: 16px; overflow: hidden; white-space: nowrap;
 }
 .metric { flex: none; display: inline-flex; align-items: baseline; gap: 5px; }
+.rels {
+  margin: 0; font-size: 12px; flex: none; height: 18px; color: var(--text);
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+}
+.relBtn { opacity: 0.55; }
+.relBtn.on { opacity: 1; box-shadow: 0 0 0 1px currentColor inset; }
 .metric b {
   display: inline-block; text-align: right; color: var(--text); font-weight: 600;
   font-variant-numeric: tabular-nums;

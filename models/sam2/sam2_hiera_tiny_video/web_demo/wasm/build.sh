@@ -52,7 +52,7 @@ python3 "$HERE/gen_runtime_stubs.py" \
 
 GEN_FLAG=()
 command -v ninja >/dev/null 2>&1 && GEN_FLAG=(-G Ninja)
-emcmake cmake -S "$HERE" -B "$HERE/build" "${GEN_FLAG[@]}" -DCMAKE_BUILD_TYPE=Release \
+emcmake cmake -S "$HERE" -B "$HERE/build" ${GEN_FLAG[@]+"${GEN_FLAG[@]}"} -DCMAKE_BUILD_TYPE=Release \
   -DLITERT_ROOT="$LITERT" -DSAMPLES_ROOT="$SAMPLES" -DABSL_ROOT="$EXT/com_google_absl" \
   -DFLATBUFFERS_ROOT="$EXT/flatbuffers" -DGEN_DIR="$GEN" >/dev/null
 cmake --build "$HERE/build" --target sam2_chain -j 8

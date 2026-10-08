@@ -185,3 +185,22 @@ export async function detect(frame: CanvasImageSource, what: string, model: stri
   await Promise.all(pending);
   return {boxes, seconds, model, raw};
 }
+
+/** A text-only request to the LiteRT-LM server; returns the whole reply. */
+export async function chatText(prompt: string, model: string, server = DEFAULT_SERVER, timeoutMs = 20000): Promise<string> {
+  const res = await fetch(`${server}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    signal: AbortSignal.timeout(timeoutMs),
+    body: JSON.stringify({model, temperature: 0, stream: true, messages: [{role: 'user', content: prompt}]}),
+  });
+  if (!res.ok) throw new Error(`LiteRT-LM server: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
+  let raw = '';
+  for (const line of (await res.text()).split('\n')) {
+    const data = line.trim().replace(/^data:\s*/, '');
+    if (!data || data === '[DONE]' || !line.trim().startsWith('data:')) continue;
+    const j = JSON.parse(data) as {choices?: Array<{delta?: {content?: string}}>};
+    raw += j.choices?.[0]?.delta?.content ?? '';
+  }
+  return raw;
+}

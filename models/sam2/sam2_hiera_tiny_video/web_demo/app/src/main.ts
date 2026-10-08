@@ -23,9 +23,13 @@
 
 import {runTurn, type ToolContext, type ToolEvent} from './agent';
 import {ChainRuntime, clearModelCache, type Effect, type ProfileMode, type RunProfile} from './chain/runtime';
-import {type DraftBox, GpuView, type Marker} from './display';
-import {DEFAULT_SERVER, detect as gemmaDetect, type GemmaBox, type GemmaResult, listModels as gemmaModels} from './gemma';
+import {type DraftBox, GpuView, type Marker, type RelationEdge} from './display';
+import {chatText, DEFAULT_SERVER, detect as gemmaDetect, type GemmaBox, type GemmaResult, listModels as gemmaModels} from './gemma';
 import {detectWeb, isWebModel, type LlmInference, loadWebGemma, WEB_MODELS, webEngine, webGemmaLoaded, webGemmaSupported, webModel} from './gemma_web';
+import {type LogFrame, PREDICATE_GROUPS, PREDICATE_PRESETS, type Relation, RelationEngine, RelationLog,
+  type RelObject} from './relations';
+import {LearnedScorer, loadRelHead} from './relhead';
+import {LabelMapper} from './psg_labels';
 import {listening, speechSupported, startDictation, stopDictation} from './speech';
 import {type JsonValue} from './toolcalls';
 import {type AppActions, makeTools} from './tools';
@@ -96,6 +100,8 @@ interface TrackedObject {
   point: {frame: number; pts: Click[]} | null;
   /** What Gemma called it ("soccer ball"), when it came from Ask Gemma. */
   label?: string;
+  /** Its PSG class ("sports ball") for the relation head, when Gemma mapped it (else the label table). */
+  psg?: string;
 }
 
 /** Camera mode: each processed frame is shown with its own masks. */
@@ -152,7 +158,77 @@ const state = {
   tracking: false,
   stop: false,
   playing: false,
+  /** Show relations between tracked objects (?rel=0 turns them off). */
+  relations: q.get('rel') !== '0',
 };
+/** Relations between tracked objects, from their masks (relations.ts). */
+const relEngine = new RelationEngine();
+/** Which scorer relEngine uses: the rules until the learned head has loaded (?rel=rules keeps the rules). */
+let relScorer: 'rules' | 'learned' = 'rules';
+/** Gemma labels -> PSG classes for the learned head (psg_labels.ts). */
+const labelMap = new LabelMapper();
+if (q.get('rel') !== 'rules') {
+  loadRelHead(asset('models/')).then(async (head) => {
+    const scorer = new LearnedScorer(head);
+    scorer.check = q.get('relcheck') === '1';
+    relEngine.scorer = scorer;
+    relScorer = 'learned';
+    console.info(`relation head: ${(head.meta.params / 1e6).toFixed(2)} M params, ${head.preds.length} PSG predicates`);
+    if (!$('relPredPanel').hidden) renderPredPanel();
+    if (state.relations && !state.live) {
+      for (const t of [...state.results.keys()].sort((a, b) => a - b)) observeStored(t);
+      drawRelations(state.frame);
+    }
+    if (state.engine) await loadTensorApiHead(state.engine);
+  }).catch((e) => console.warn('relation head unavailable, using the rules:', e));
+}
+/**
+ * Default: the head authored with the Tensor API in the wasm pipeline
+ * (cc/relhead_graph.cc). It runs on WebGPU on the pipeline's mask buffers, so
+ * only the [6, 6, P] logits are read back (ram/README.md section 6). The TS
+ * head (relhead.ts, CPU) is the fallback, and ?rel=ts selects it.
+ */
+const REL_TENSORAPI = q.get('rel') !== 'ts';
+let tensorApiHead: ChainRuntime | null = null;
+async function loadTensorApiHead(rt: ChainRuntime) {
+  if (!REL_TENSORAPI || !(relEngine.scorer instanceof LearnedScorer) || tensorApiHead === rt) return;
+  if (!rt.hasRelationHead) {
+    console.warn('Tensor API relation head: this wasm build has no relation head; using the TS head');
+    return;
+  }
+  try {
+    const info = await exclusive(() => rt.loadRelations(asset('models/relhead.safetensors')));
+    tensorApiHead = rt;
+    console.info(`relation head (Tensor API, WebGPU): ${info.predicates} predicates, ${info.classes} classes`);
+  } catch (e) {
+    console.warn('Tensor API relation head: loading failed; using the TS head:', e);
+  }
+}
+/** Runs the Tensor API head on frame t's pipeline masks for the next scoreFrame (inside exclusive()). */
+async function tensorApiRelations(t: number) {
+  const rt = state.engine, sc = relEngine.scorer;
+  if (!rt || tensorApiHead !== rt || !(sc instanceof LearnedScorer)) return;
+  const M = rt.maxObjects;
+  const cls = new Array<number>(M).fill(0);
+  const slot = new Map<number, number>();
+  for (const o of state.objects) {
+    if (!o.point || o.slot < 0 || o.slot >= M) continue;
+    cls[o.slot] = sc.head.classIndex(o.psg ?? labelMap.get(o.label ?? ''));
+    slot.set(o.id, o.slot);
+  }
+  const t0 = performance.now();
+  try {
+    const logits = await rt.relations(t, cls);
+    sc.useLogits({logits, M, slot, ms: performance.now() - t0});
+  } catch (e) {
+    console.warn(e);
+    sc.useLogits(null);
+  }
+}
+/** Frame idx -> relations, for trace-back and export (relations.ts). */
+const relLog = new RelationLog();
+let relMs = 0;
+let liveT0 = 0;  // camera session start (ms), for log times
 /** The object the chips box last scrolled into view. */
 let shownSelected = -1;
 
@@ -280,6 +356,166 @@ function present(t: number) {
   if (!rt || !gpuView) return;
   gpuView.show(rt.outputBuffer);
   gpuView.drawMarkers(markersFor(t));
+  drawRelations(t);
+}
+
+// ---------------------------------------------------------------- relations
+
+/** Scores the relations of frame t from the masks just read back, and logs them. */
+function observeRelations(t: number, time: number, objs: Array<{o: TrackedObject; mask: Float32Array}>) {
+  const list: RelObject[] = objs.map(({o, mask}) => ({id: o.id, label: o.label ?? '', mask,
+    cls: o.psg ?? labelMap.get(o.label ?? '')}));
+  relMs = relEngine.observe(t, time, list);
+  if (relEngine.scorer instanceof LearnedScorer) relEngine.scorer.useLogits(null);
+  const ids = new Set(objs.map(({o}) => o.id));
+  const label = (id: number) => {
+    const o = state.objects.find((x) => x.id === id);
+    return o?.label || `object ${o ? state.objects.indexOf(o) + 1 : id}`;
+  };
+  relLog.record(t, time, relEngine.relationsAt(t, ids).map((r) => ({
+    s: r.s, sLabel: label(r.s), predicate: r.predicate, o: r.o, oLabel: label(r.o), score: r.score})));
+  scheduleLogRender();
+}
+
+// ---------------------------------------------------------------- relation log (trace back)
+
+let logView: 'frames' | 'events' = 'frames';
+let logRenderPending = false;
+let logRenderedAt = 0;
+
+/** Re-renders the open log drawer at most ~4x a second. */
+function scheduleLogRender() {
+  if ($('relLogPanel').hidden || logRenderPending) return;
+  logRenderPending = true;
+  const wait = Math.max(0, 250 - (performance.now() - logRenderedAt));
+  setTimeout(() => {
+    logRenderPending = false;
+    logRenderedAt = performance.now();
+    renderLog();
+  }, wait);
+}
+
+const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+const objTag = (id: number, label: string) => {
+  const o = state.objects.find((x) => x.id === id);
+  const c = o ? `rgb(${o.color.join(',')})` : 'var(--muted)';
+  return `<span class="tag" style="--c:${c}">${esc(label)}<sup>#${id}</sup></span>`;
+};
+const relHtml = (r: {s: number; sLabel: string; predicate: string; o: number; oLabel: string}) =>
+  `${objTag(r.s, r.sLabel)} <b>${esc(r.predicate)}</b> ${objTag(r.o, r.oLabel)}`;
+const fmtTime = (s: number) => `${Math.floor(s / 60)}:${(s % 60).toFixed(2).padStart(5, '0')}`;
+
+/** Frame shown now (camera: the newest frame with masks). */
+const currentFrame = () => (state.live ? state.live.maskT : state.frame);
+
+function renderLog() {
+  const list = $('relLogList');
+  const frames = relLog.list();
+  const withRel = frames.filter((f) => f.relations.length);
+  const spans = relLog.spans();
+  $('relLogCount').textContent = `${withRel.length} / ${frames.length} frames · ${spans.length} events`;
+  const cur = currentFrame();
+  const MAX_ROWS = 400;  // camera sessions get long: newest rows only
+  let html = '';
+  if (logView === 'frames') {
+    const rows = withRel.slice(-MAX_ROWS);
+    html = rows.map((f: LogFrame) => `<li data-f="${f.frame}" class="${f.frame === cur ? 'cur' : ''}">` +
+        `<span class="fi">${f.frame}</span><span class="ft">${fmtTime(f.time)}</span>` +
+        `<span class="rs">${f.relations.map(relHtml).join('<i>·</i>')}</span></li>`).join('');
+  } else {
+    html = spans.slice(-MAX_ROWS).map((s) => `<li data-f="${s.start}" class="${cur >= s.start && cur <= s.end ? 'cur' : ''}">` +
+        `<span class="fi">${s.start}${s.end > s.start ? `–${s.end}` : ''}</span>` +
+        `<span class="ft">${fmtTime(s.startTime)}</span>` +
+        `<span class="rs">${relHtml(s)} <em>${s.frames} f · peak ${s.peak.toFixed(2)}</em></span></li>`).join('');
+  }
+  list.innerHTML = html || `<li class="empty">No relations logged yet. Track objects (or start the camera) with ⇄ on.</li>`;
+  const curRow = list.querySelector('li.cur');
+  if (curRow && !state.live) curRow.scrollIntoView({block: 'nearest'});
+  else if (state.live) list.scrollTop = list.scrollHeight;
+}
+
+/** Trace back: show frame f of the video with its masks and relations. */
+function seekLog(f: number) {
+  if (state.live || relLog.meta.source === 'camera') {
+    $('trackInfo').textContent = `Frame ${f} is from the camera session: its video isn't stored, so it can't be shown again.`;
+    return;
+  }
+  if (!state.clip || state.tracking || f < 0 || f >= state.clip.frames.length) return;
+  stopPlayback();
+  state.frame = f;
+  render();
+  scheduleLogRender();
+}
+
+function download(name: string, text: string, type: string) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], {type}));
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+const logFileBase = () => `relations_${(relLog.meta.source || 'log').replace(/[^\w.-]+/g, '_')}_` +
+    relLog.meta.startedAt.replace(/[:.]/g, '-').slice(0, 19);
+
+function clearLog() {
+  const clip = state.clip;
+  relLog.clear(state.live
+    ? {source: 'camera', width: state.live.width, height: state.live.height}
+    : {source: clip?.name ?? '', fps: clip?.fps, width: clip?.width, height: clip?.height});
+  scheduleLogRender();
+}
+
+/** Frame t's stored masks (file mode) -> relation engine. */
+function observeStored(t: number) {
+  const res = state.results.get(t);
+  if (!res || !state.clip) return;
+  const objs = state.objects.flatMap((o) => (res.has(o.id) ? [{o, mask: res.get(o.id)!}] : []));
+  observeRelations(t, t / state.clip.fps, objs);
+}
+
+/** The newest scored frame at or just before t (camera: masks trail the video). */
+function relFrame(t: number): number | null {
+  for (let k = 0; k < 4; k++) if (relEngine.has(t - k)) return t - k;
+  return null;
+}
+
+function currentRelations(t: number): {t: number; rels: Relation[]} | null {
+  const f = relFrame(t);
+  if (f === null) return null;
+  const ids = new Set(state.objects.filter((o) => o.point).map((o) => o.id));
+  return {t: f, rels: relEngine.relationsAt(f, ids)};
+}
+
+const objName = (o: TrackedObject) => `${state.objects.indexOf(o) + 1} ${o.label ?? 'object'}`;
+
+function relationText(r: Relation): string {
+  const s = state.objects.find((o) => o.id === r.s), o = state.objects.find((x) => x.id === r.o);
+  return s && o ? `${objName(s)} ${r.predicate} ${objName(o)}` : '';
+}
+
+function drawRelations(t: number) {
+  const list = $('relList');
+  const cur = state.relations ? currentRelations(t) : null;
+  if (!cur || !gpuView) {
+    list.textContent = '';
+    return;
+  }
+  const edges: RelationEdge[] = [];
+  for (const r of cur.rels) {
+    const a = relEngine.centroid(cur.t, r.s), b = relEngine.centroid(cur.t, r.o);
+    const s = state.objects.find((o) => o.id === r.s);
+    if (!a || !b || !s) continue;
+    edges.push({x0: a[0], y0: a[1], x1: b[0], y1: b[1], text: r.predicate, color: s.color, score: r.score,
+      directed: !relEngine.scorer.symmetric.has(r.predicate)});
+  }
+  gpuView.drawRelations(edges);
+  const sc = relEngine.scorer instanceof LearnedScorer ? relEngine.scorer : null;
+  const ta = !!sc && !!state.engine && tensorApiHead === state.engine;
+  const who = !sc ? 'rules' : ta ? 'PSG head · Tensor API WebGPU' : 'PSG head · JS';
+  list.textContent = cur.rels.length
+    ? `Relations (${who}) · ${(relMs + (ta && sc!.lastSource === 'tensorapi' ? sc!.lastMs : 0)).toFixed(1)} ms: ` +
+      cur.rels.map(relationText).filter(Boolean).join(' · ')
+    : '';
 }
 
 async function loadEngine(size: ModelSize) {
@@ -310,6 +546,7 @@ async function loadEngine(size: ModelSize) {
     old?.dispose();
     rt.setProfile(PROFILE);
     state.engine = rt;
+    await loadTensorApiHead(rt);
     $('backendPill').textContent = label;
     state.loading = false;
     if (source()) {
@@ -371,6 +608,10 @@ async function collect(t: number, objs: TrackedObject[]) {
     const m = masks[i];
     if (m) res.set(o.id, m); else res.delete(o.id);
   });
+  if (state.relations) {
+    await tensorApiRelations(t);
+    observeStored(t);
+  }
 }
 
 /** Yields to the macrotask queue without Chrome's 4 ms nested-setTimeout clamp. */
@@ -401,6 +642,7 @@ function resetObjects() {
   state.objects = [];
   state.nextId = 1;
   state.results.clear();
+  relEngine.reset();
   addObject();
 }
 
@@ -453,6 +695,7 @@ async function setClip(clip: Clip) {
   stopPlayback();
   state.clip?.frames.forEach((f) => f.close());
   state.clip = clip;
+  clearLog();
   state.frame = 0;
   scrubber.max = String(clip.frames.length - 1);
   scrubber.value = '0';
@@ -473,6 +716,7 @@ async function setClip(clip: Clip) {
 let renderWanted = false;
 function render() {
   if (state.live || !state.clip) return;
+  scheduleLogRender();
   scrubber.value = String(state.frame);
   $('counter').textContent = `${state.frame + 1} / ${state.clip.frames.length}`;
   drawTimeline();
@@ -813,10 +1057,34 @@ async function findObjects(g: Chosen, what: string, max = maxObjects()): Promise
     return {found: 0, labels, seconds: found.seconds};
   }
   const used = Math.min(found.boxes.length, limit);
+  await mapLabels(g);
   objHint(`${g.name} found ${used} (${[...new Set(labels)].join(', ') || what}) in ${found.seconds.toFixed(1)} s` +
       (used === maxObjects() ? ` (${maxObjects()} objects max)` : '') +
       '. Refine with clicks or press Track.');
   return {found: used, labels: [...new Set(labels)], seconds: found.seconds};
+}
+
+/**
+ * Objects' labels -> PSG classes for the relation head: the table first, then
+ * one text-only Gemma question for the rest. Failures leave them unknown.
+ */
+async function mapLabels(g: Chosen) {
+  if (!state.relations || relScorer !== 'learned') return;
+  const todo = labelMap.pending(state.objects.map((o) => o.label ?? ''));
+  if (todo.length) {
+    objHint(`${g.name}: matching ${todo.map((l) => `“${l}”`).join(', ')} to relation classes…`);
+    try {
+      const got = await labelMap.resolve(todo, (prompt) => g.llm
+        ? webEngine(g.llm).generate(prompt, () => undefined)
+        : chatText(prompt, `${g.modelId},gpu`, GEMMA_SERVER));
+      console.info('Gemma label -> PSG class:', Object.fromEntries(got));
+    } catch (e) {
+      console.warn('label mapping failed:', e);
+    }
+  }
+  for (const o of state.objects) if (o.label) o.psg = labelMap.get(o.label) || undefined;
+  relEngine.reset();
+  if (!state.live) for (const t of [...state.results.keys()].sort((a, b) => a - b)) observeStored(t);
 }
 
 /** Find only (the server models, or ?agent=0): the text is what to look for. */
@@ -935,6 +1203,7 @@ const appActions: AppActions = {
       model: `${state.size} px, ${state.nmm}-frame memory, WebGPU fp16`,
       tracking: state.tracking,
       playing: state.playing,
+      relations: (currentRelations(L ? L.maskT : state.frame)?.rels ?? []).map(relationText),
     };
   },
   measure(): JsonValue {
@@ -1079,6 +1348,8 @@ async function track() {
   const start = Math.min(...objs.map((o) => o.point!.frame));
   const n = clip.frames.length;
   for (const o of objs) for (const [t, m] of state.results) if (t !== o.point!.frame) m.delete(o.id);
+  relEngine.reset();
+  clearLog();
   $('progress').hidden = false;
   const times: number[] = [];
   try {
@@ -1099,6 +1370,10 @@ async function track() {
         present(t);
         const active = objs.filter((o) => o.point!.frame <= t);
         await collect(t, active);
+        if (state.relations) {
+          gpuView?.drawMarkers(markersFor(t));
+          drawRelations(t);
+        }
         const took = performance.now() - t0;
         times.push(took);
         scrubber.value = String(t);
@@ -1197,6 +1472,8 @@ async function startCamera() {
   };
   video.requestVideoFrameCallback(onFrame);
   state.live = L;
+  liveT0 = performance.now();
+  clearLog();
   resetObjects();
   await applyGeometry();
   const camFps = stream.getVideoTracks()[0]?.getSettings().frameRate;
@@ -1288,7 +1565,20 @@ async function liveLoop(L: Live) {
           // Queue the blit before the readback: the GPU runs it right after
           // track's composite instead of after a readback round trip.
           if (state.liveDisplay === 'aligned') present(t);
-          await rt.readScores(rt.trackedObjects(t)[0], t);  // wait for the GPU
+          if (state.relations) {
+            // One batched readback of every tracked mask (also waits for the GPU).
+            const slots = rt.trackedObjects(t);
+            const masks = await rt.readMasks(slots, t);
+            const objs = slots.flatMap((k, i) => {
+              const o = state.objects.find((x) => x.slot === k && x.point);
+              return o && masks[i] ? [{o, mask: masks[i]!}] : [];
+            });
+            await tensorApiRelations(t);
+            observeRelations(t, Math.max(0, born - liveT0) / 1000, objs);
+            relEngine.prune(t);
+          } else {
+            await rt.readScores(rt.trackedObjects(t)[0], t);  // wait for the GPU
+          }
           const s4 = performance.now();
           if (PROFILE) {
             recordProfile({upload: s1 - s0, encode: s2 - s1, track: s3 - s2, read: s4 - s3, total: s4 - s0},
@@ -1477,6 +1767,150 @@ $('trackBtn').addEventListener('click', () => {
   else void track();
 });
 $('playBtn').addEventListener('click', togglePlay);
+const relBtn = $('relBtn');
+relBtn.classList.toggle('on', state.relations);
+relBtn.addEventListener('click', () => {
+  state.relations = !state.relations;
+  relBtn.classList.toggle('on', state.relations);
+  // File mode: score the frames tracked while relations were off.
+  if (state.relations && !state.live) {
+    for (const t of [...state.results.keys()].sort((a, b) => a - b)) observeStored(t);
+  }
+  rerenderStill();
+});
+const logPanel = $('relLogPanel');
+const setLogOpen = (open: boolean) => {
+  logPanel.hidden = !open;
+  $('logBtn').classList.toggle('on', open);
+  if (open) {
+    setPredOpen(false);
+    renderLog();
+  }
+};
+$('logBtn').addEventListener('click', () => setLogOpen(logPanel.hidden !== false));
+$('relLogClose').addEventListener('click', () => setLogOpen(false));
+
+// ---- predicate picker: which predicates may be shown / logged
+const predPanel = $('relPredPanel');
+function setPredOpen(open: boolean) {
+  predPanel.hidden = !open;
+  $('predBtn').classList.toggle('on', open || relEngine.allowed !== null);
+  if (open) {
+    logPanel.hidden = true;
+    $('logBtn').classList.remove('on');
+    renderPredPanel();
+  }
+}
+/** Applies a predicate selection (null = all): engine filter, saved, log and overlay redone. */
+function setPredicates(sel: Iterable<string> | null) {
+  const avail = relEngine.scorer.predicates;
+  const set = sel ? new Set([...sel].filter((p) => avail.includes(p))) : null;
+  relEngine.allowed = set && set.size === avail.length ? null : set;
+  try {
+    if (relEngine.allowed) localStorage.setItem('sam2.relPreds', JSON.stringify([...relEngine.allowed]));
+    else localStorage.removeItem('sam2.relPreds');
+  } catch { /* storage unavailable */ }
+  if (state.relations && !state.live) {
+    for (const t of [...state.results.keys()].sort((a, b) => a - b)) observeStored(t);
+  }
+  $('predBtn').classList.toggle('on', !predPanel.hidden || relEngine.allowed !== null);
+  if (!predPanel.hidden) renderPredPanel();
+  rerenderStill();
+}
+function savedPredicates(): string[] | null {
+  const p = q.get('preds');
+  if (p) return p.split(',').map((s) => s.trim()).filter(Boolean);
+  try {
+    const s = localStorage.getItem('sam2.relPreds');
+    return s ? (JSON.parse(s) as string[]) : null;
+  } catch {
+    return null;
+  }
+}
+function renderPredPanel() {
+  const avail = new Set(relEngine.scorer.predicates);
+  const on = (p: string) => avail.has(p) && (!relEngine.allowed || relEngine.allowed.has(p));
+  const shown = [...avail].filter(on).length;
+  $('relPredCount').textContent = `${shown} / ${avail.size} on · ${relScorer === 'learned' ? 'PSG head' : 'rules'}`;
+  const presets = $('relPredPresets');
+  presets.replaceChildren();
+  const preset = (name: string, sel: Iterable<string> | null, title: string) => {
+    const b = document.createElement('button');
+    b.className = 'btn';
+    b.textContent = name;
+    b.title = title;
+    b.addEventListener('click', () => setPredicates(sel));
+    presets.append(b);
+  };
+  preset('All', null, 'Every predicate the scorer knows');
+  preset('None', [], 'Hide all relations');
+  for (const [name, list] of Object.entries(PREDICATE_PRESETS)) preset(name, list, list.join(', '));
+  const groups = $('relPredGroups');
+  groups.replaceChildren();
+  const grouped = new Set(PREDICATE_GROUPS.flatMap(([, l]) => l));
+  const all: Array<[string, readonly string[]]> = [...PREDICATE_GROUPS,
+    ['Other', [...avail].filter((p) => !grouped.has(p))]];
+  for (const [name, list] of all) {
+    if (!list.length) continue;
+    const fs = document.createElement('fieldset');
+    const lg = document.createElement('legend');
+    const usable = list.filter((p) => avail.has(p));
+    lg.textContent = `${name} (${usable.filter(on).length}/${usable.length})`;
+    lg.title = 'Click to toggle the whole group';
+    lg.addEventListener('click', () => {
+      const cur = new Set(relEngine.allowed ?? avail);
+      const allOn = usable.every((p) => cur.has(p));
+      for (const p of usable) (allOn ? cur.delete(p) : cur.add(p));
+      setPredicates(cur);
+    });
+    const chips = document.createElement('div');
+    chips.className = 'predChips';
+    for (const p of list) {
+      const l = document.createElement('label');
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = on(p);
+      cb.disabled = !avail.has(p);
+      cb.dataset.p = p;
+      if (!avail.has(p)) {
+        l.className = 'na';
+        l.title = `Not produced by the ${relScorer === 'learned' ? 'PSG head' : 'rules'}`;
+      }
+      cb.addEventListener('change', () => {
+        const cur = new Set(relEngine.allowed ?? avail);
+        if (cb.checked) cur.add(p);
+        else cur.delete(p);
+        setPredicates(cur);
+      });
+      l.append(cb, p);
+      chips.append(l);
+    }
+    fs.append(lg, chips);
+    groups.append(fs);
+  }
+}
+$('predBtn').addEventListener('click', () => setPredOpen(predPanel.hidden !== false));
+$('relPredClose').addEventListener('click', () => setPredOpen(false));
+{
+  const saved = savedPredicates();
+  if (saved) relEngine.allowed = new Set(saved);  // filtered to the scorer's list when the head loads
+  $('predBtn').classList.toggle('on', relEngine.allowed !== null);
+}
+$('relLogView').addEventListener('click', (ev) => {
+  const b = (ev.target as HTMLElement).closest('button');
+  if (!b) return;
+  logView = b.dataset.v as typeof logView;
+  for (const x of $('relLogView').querySelectorAll('button')) x.classList.toggle('on', x === b);
+  renderLog();
+});
+$('relLogList').addEventListener('click', (ev) => {
+  const li = (ev.target as HTMLElement).closest('li[data-f]') as HTMLElement | null;
+  if (li) seekLog(Number(li.dataset.f));
+});
+$('relLogJson').addEventListener('click', () =>
+  download(`${logFileBase()}.json`, JSON.stringify(relLog.toJSON(), null, 1), 'application/json'));
+$('relLogCsv').addEventListener('click', () => download(`${logFileBase()}.csv`, relLog.toCSV(), 'text/csv'));
+$('relLogClear').addEventListener('click', () => clearLog());
 scrubber.addEventListener('input', () => {
   stopPlayback();
   state.frame = Number(scrubber.value);
@@ -1535,6 +1969,17 @@ window.addEventListener('resize', drawTimeline);
 
 // Read-only handle for the UI tests.
 (window as unknown as {__sam2: typeof state}).__sam2 = state;
+(window as unknown as {__relations: unknown}).__relations = {
+  engine: relEngine, at: currentRelations, text: relationText, ms: () => relMs, log: relLog,
+  scorer: () => relScorer, labels: labelMap, setPredicates,
+  psg: () => state.objects.map((o) => ({id: o.id, label: o.label ?? '', psg: o.psg ?? labelMap.get(o.label ?? '')})),
+  /** Whether the Tensor API head (default; ?rel=ts = JS head) is loaded, the last frame's source and the ?relcheck=1 stats. */
+  tensorApi: () => {
+    const sc = relEngine.scorer instanceof LearnedScorer ? relEngine.scorer : null;
+    return {loaded: !!state.engine && tensorApiHead === state.engine, source: sc?.lastSource ?? null,
+      ms: sc?.lastMs ?? 0, checks: sc?.checks ?? []};
+  },
+};
 
 void probeGemma();
 showOverlay('Loading the pipeline…', {spinner: true});
